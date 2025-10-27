@@ -1,0 +1,521 @@
+Attribute VB_Name = "Import_Saleout"
+Option Explicit
+
+' =========================
+' Public entry (Alt+F8)
+' =========================
+Public Sub Run_Import_Default()
+    ImportSaleoutAndBuildDefault
+End Sub
+
+' =========================
+' Orchestrator: pick file -> import temp -> build/update Saleout (reuse SaleoutTable) -> cleanup -> select DOI!B4
+' =========================
+Private Sub ImportSaleoutAndBuildDefault()
+    Dim prevCalc As XlCalculation
+    Dim prevScreenUpdating As Boolean
+    Dim prevEnableEvents As Boolean
+    Dim prevDisplayAlerts As Boolean
+    
+    prevCalc = Application.Calculation
+    prevScreenUpdating = Application.ScreenUpdating
+    prevEnableEvents = Application.EnableEvents
+    prevDisplayAlerts = Application.DisplayAlerts
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    
+    On Error GoTo Fail
+    
+    ' ---- Pick source file (sales) ----
+    Dim srcPath As String
+    srcPath = PickExcelFile()
+    If Len(srcPath) = 0 Then GoTo FinallyExit  ' user cancelled
+    
+    ' ---- Open source (read-only) ----
+    Dim wbSrc As Workbook
+    Set wbSrc = Workbooks.Open(fileName:=srcPath, ReadOnly:=True)
+    
+    ' ---- Get data sheet (prefer "Data") ----
+    Dim wsDataSrc As Worksheet
+    Set wsDataSrc = GetFirstDataSheet(wbSrc)
+    If wsDataSrc Is Nothing Then
+        MsgBox "No usable worksheet found in the selected file.", vbExclamation
+        GoTo CloseSourceAndExit
+    End If
+    
+    ' ---- Create temp data sheet in THIS workbook and copy values (to avoid external links) ----
+    Dim tmpDataName As String: tmpDataName = EnsureUniqueSheetName(CreateTempSheetName("__TMP_Data_"))
+    Dim wsTmpData As Worksheet
+    Set wsTmpData = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.count))
+    wsTmpData.name = tmpDataName
+    
+    With wsDataSrc.UsedRange
+        wsTmpData.Range("A1").Resize(.Rows.count, .Columns.count).Value = .Value
+    End With
+    
+CloseSourceAndExit:
+    On Error Resume Next
+    wbSrc.Close SaveChanges:=False
+    On Error GoTo 0
+    If wsTmpData Is Nothing Then GoTo FinallyExit
+    
+    ' ---- Build/Update Saleout (reuse SaleoutTable; compute SellingDays from Posting Date) ----
+    Call BuildOrUpdate_Saleout_FromTempData(wsTmpData.name, "Saleout", "SaleoutTable")
+    
+    ' ---- Move cursor (selection) to DOI!B4 ----
+    On Error Resume Next
+    ThisWorkbook.Worksheets("DOI").Activate
+    ThisWorkbook.Worksheets("DOI").Range("B4").Select
+    On Error GoTo 0
+    
+    ' ---- Cleanup temp sheet ----
+    On Error Resume Next
+    ThisWorkbook.Worksheets(wsTmpData.name).Delete
+    On Error GoTo 0
+    
+    MsgBox "Done. Saleout updated.", vbInformation
+    GoTo FinallyExit
+
+Fail:
+    MsgBox "Error in ImportSaleoutAndBuildDefault: " & Err.Description, vbCritical
+
+FinallyExit:
+    Application.ScreenUpdating = prevScreenUpdating
+    Application.EnableEvents = prevEnableEvents
+    Application.DisplayAlerts = prevDisplayAlerts
+    Application.Calculation = prevCalc
+End Sub
+
+' =========================
+' Core: Build/Update Saleout using a Pivot (Sum of Quantity per Plant & Material)
+'        REUSE SaleoutTable (no delete/unlist to prevent #REF)
+'        Auto-compute SellingDays from Posting Date
+' =========================
+Private Sub BuildOrUpdate_Saleout_FromTempData(ByVal SourceSheetName As String, _
+                                               ByVal OutputSheetName As String, _
+                                               ByVal OutputTableName As String)
+    Dim prevCalc As XlCalculation
+    Dim prevScreenUpdating As Boolean
+    Dim prevEnableEvents As Boolean
+    Dim prevDisplayAlerts As Boolean
+    
+    prevCalc = Application.Calculation
+    prevScreenUpdating = Application.ScreenUpdating
+    prevEnableEvents = Application.EnableEvents
+    prevDisplayAlerts = Application.DisplayAlerts
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    
+    On Error GoTo Fail
+    
+    ' --- Source temp sheet
+    Dim wsSrc As Worksheet
+    Set wsSrc = ThisWorkbook.Worksheets(SourceSheetName)
+    If wsSrc Is Nothing Then
+        MsgBox "Temp source sheet not found: " & SourceSheetName, vbExclamation
+        GoTo FinallyExit
+    End If
+    
+    ' Determine source range & validate headers
+    Dim rngSrc As Range
+    Dim colPlant As Long, colMaterial As Long, colQty As Long
+    colPlant = FindHeaderColumn(wsSrc, "Plant")
+    colMaterial = FindHeaderColumn(wsSrc, "Material")
+    colQty = FindHeaderColumn(wsSrc, "Quantity")
+    If colPlant = 0 Or colMaterial = 0 Or colQty = 0 Then
+        MsgBox "Required columns 'Plant', 'Material', or 'Quantity' are missing in source.", vbCritical
+        GoTo FinallyExit
+    End If
+    
+    Dim lastRow As Long, lastCol As Long
+    lastRow = wsSrc.Cells(wsSrc.Rows.count, colMaterial).End(xlUp).Row
+    lastCol = wsSrc.Cells(1, wsSrc.Columns.count).End(xlToLeft).Column
+    If lastRow < 2 Then
+        MsgBox "No data rows found in source.", vbInformation
+        GoTo FinallyExit
+    End If
+    Set rngSrc = wsSrc.Range(wsSrc.Cells(1, 1), wsSrc.Cells(lastRow, lastCol))
+    
+    ' === Compute SellingDays from Posting Date ===
+    Dim daysNum As Double
+    daysNum = ComputeSellingDaysFromPostingDate(wsSrc, "Posting Date")
+    If daysNum < 1 Then daysNum = 1   ' safety
+    
+    ' --- Create a temp pivot sheet
+    Dim tmpPivotName As String: tmpPivotName = EnsureUniqueSheetName(CreateTempSheetName("__TMP_Pivot_"))
+    Dim wsPv As Worksheet
+    Set wsPv = ThisWorkbook.Worksheets.Add(After:=wsSrc)
+    wsPv.name = tmpPivotName
+    
+    ' Build pivot: Sum of Quantity by Plant & Material
+    Dim pc As pivotCache, pt As pivotTable
+    Set pc = ThisWorkbook.PivotCaches.Create(SourceType:=xlDatabase, SourceData:=rngSrc.Address(External:=True))
+    On Error Resume Next: pc.MissingItemsLimit = xlMissingItemsNone: On Error GoTo 0
+    
+    Set pt = pc.CreatePivotTable(TableDestination:=wsPv.Range("A3"), TableName:=tmpPivotName)
+    With pt
+        .ManualUpdate = True
+        On Error Resume Next
+        .RowFields.Clear: .ColumnFields.Clear: .DataFields.Clear
+        On Error GoTo 0
+        
+        .PivotFields("Plant").Orientation = xlRowField
+        .PivotFields("Material").Orientation = xlRowField
+        .AddDataField .PivotFields("Quantity"), "Sum of Quantity", xlSum
+        .DataFields(1).NumberFormat = "General"
+        
+        .RowAxisLayout xlTabularRow
+        .RepeatAllLabels xlRepeatLabels
+        SetNoSubtotal .PivotFields("Plant")
+        SetNoSubtotal .PivotFields("Material")
+        .RowGrand = False
+        .ColumnGrand = False
+        .ManualUpdate = False
+    End With
+    
+    ' Locate pivot header and rows
+    Dim hdrRow As Long, firstDataRow As Long, lastPivotRow As Long
+    hdrRow = pt.TableRange1.Row
+    firstDataRow = hdrRow + 1
+    
+    Dim colPivotPlant As Long, colPivotMaterial As Long, colPivotQty As Long
+    colPivotPlant = FindHeaderColumnInRow(wsPv, "Plant", hdrRow)
+    colPivotMaterial = FindHeaderColumnInRow(wsPv, "Material", hdrRow)
+    colPivotQty = FindHeaderColumnInRow(wsPv, "Sum of Quantity", hdrRow)
+    If colPivotPlant = 0 Or colPivotMaterial = 0 Or colPivotQty = 0 Then
+        MsgBox "Unable to locate pivot headers.", vbCritical
+        GoTo CleanPivotAndExit
+    End If
+    
+    lastPivotRow = wsPv.Cells(wsPv.Rows.count, colPivotPlant).End(xlUp).Row
+    If lastPivotRow < firstDataRow Then
+        MsgBox "Pivot produced no rows.", vbInformation
+        GoTo CleanPivotAndExit
+    End If
+    
+    ' Build output array from pivot rows
+    Dim n As Long: n = lastPivotRow - firstDataRow + 1
+    Dim arrOut() As Variant
+    ReDim arrOut(1 To n, 1 To 7)
+    
+    Dim r As Long, i As Long
+    Dim sPlant As String, sMat As String
+    Dim qty As Double
+    Dim plantCode As String, plantName As String
+    Dim matCode As String, matName As String
+    
+    i = 1
+    For r = firstDataRow To lastPivotRow
+        sPlant = CStr(wsPv.Cells(r, colPivotPlant).Value)
+        sMat = CStr(wsPv.Cells(r, colPivotMaterial).Value)
+        qty = CDbl(val(wsPv.Cells(r, colPivotQty).Value))
+        
+        plantCode = ExtractInsideParenthesesOrOriginal(sPlant)
+        plantName = Trim$(RemoveParentheses(sPlant))
+        matCode = ExtractInsideParenthesesOrOriginal(sMat)
+        matName = Trim$(RemoveParentheses(sMat))
+        
+        ' Fill 7 columns: Comp, Plant Code, Plant Name, Material Code, Material Name, Quantity, Average
+        arrOut(i, 1) = "'" & plantCode & matCode  ' Comp (text)
+        arrOut(i, 2) = "'" & plantCode            ' Plant Code (text)
+        arrOut(i, 3) = plantName                  ' Plant Name
+        arrOut(i, 4) = "'" & matCode              ' Material Code (text)
+        arrOut(i, 5) = matName                    ' Material Name
+        arrOut(i, 6) = qty                        ' Quantity (numeric)
+        arrOut(i, 7) = IIf(daysNum > 0, qty / daysNum, 0) ' Average (numeric)
+        i = i + 1
+    Next r
+    
+    ' --- REUSE output SaleoutTable
+    Dim wsOut As Worksheet
+    Set wsOut = GetOrCreateWorksheet(OutputSheetName)
+    
+    Dim lo As ListObject
+    Set lo = GetListObjectByName(wsOut, OutputTableName)
+    
+    If lo Is Nothing Then
+        ' Create headers (7 columns)
+        Dim headers As Variant
+        headers = Array("Comp", "Plant Code", "Plant Name", "Material Code", "Material Name", "Quantity", "Average")
+        wsOut.Range("A1").Resize(1, UBound(headers) + 1).Value = headers
+        
+        Set lo = wsOut.ListObjects.Add(xlSrcRange, wsOut.Range("A1").Resize(1, UBound(headers) + 1), , xlYes)
+        lo.name = OutputTableName
+        lo.TableStyle = "TableStyleMedium2"
+    Else
+        ' Ensure header names are stable (in case of user edits)
+        SafeSetHeader lo, 1, "Comp"
+        SafeSetHeader lo, 2, "Plant Code"
+        SafeSetHeader lo, 3, "Plant Name"
+        SafeSetHeader lo, 4, "Material Code"
+        SafeSetHeader lo, 5, "Material Name"
+        SafeSetHeader lo, 6, "Quantity"
+        SafeSetHeader lo, 7, "Average"
+    End If
+    
+    ' Clear old rows and resize for new data
+    If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.Delete
+    lo.Resize lo.Range.Resize(1 + n, lo.ListColumns.count)
+    
+    ' Write data by columns (name-safe)
+    WriteColumn lo, "Comp", GetArrayColumn(arrOut, 1)
+    WriteColumn lo, "Plant Code", GetArrayColumn(arrOut, 2)
+    WriteColumn lo, "Plant Name", GetArrayColumn(arrOut, 3)
+    WriteColumn lo, "Material Code", GetArrayColumn(arrOut, 4)
+    WriteColumn lo, "Material Name", GetArrayColumn(arrOut, 5)
+    WriteColumn lo, "Quantity", GetArrayColumn(arrOut, 6)
+    WriteColumn lo, "Average", GetArrayColumn(arrOut, 7)
+    
+    ' Apply formats
+    On Error Resume Next
+    lo.ListColumns("Comp").DataBodyRange.NumberFormat = "@"
+    lo.ListColumns("Plant Code").DataBodyRange.NumberFormat = "@"
+    lo.ListColumns("Material Code").DataBodyRange.NumberFormat = "@"
+    lo.ListColumns("Quantity").DataBodyRange.NumberFormat = "0.00" ' 2 decimals
+    lo.ListColumns("Average").DataBodyRange.NumberFormat = "0.00"  ' 2 decimals
+    On Error GoTo 0
+    
+    ' Autofit
+    lo.Range.EntireColumn.AutoFit
+    
+CleanPivotAndExit:
+    ' Delete temp pivot
+    On Error Resume Next
+    If Not wsPv Is Nothing Then wsPv.Delete
+    On Error GoTo 0
+    
+    GoTo FinallyExit
+
+Fail:
+    MsgBox "Error in BuildOrUpdate_Saleout_FromTempData: " & Err.Description, vbCritical
+
+FinallyExit:
+    Application.ScreenUpdating = prevScreenUpdating
+    Application.EnableEvents = prevEnableEvents
+    Application.DisplayAlerts = prevDisplayAlerts
+    Application.Calculation = prevCalc
+End Sub
+
+' =========================
+' NEW: Compute SellingDays from Posting Date
+' =========================
+Private Function ComputeSellingDaysFromPostingDate(ByVal ws As Worksheet, ByVal headerName As String) As Double
+    Dim colPost As Long
+    colPost = FindHeaderColumn(ws, headerName)
+    If colPost = 0 Then colPost = FindHeaderColumn(ws, "PostingDate") ' fallback
+    
+    If colPost = 0 Then
+        ComputeSellingDaysFromPostingDate = 1
+        Exit Function
+    End If
+    
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.count, colPost).End(xlUp).Row
+    If lastRow < 2 Then
+        ComputeSellingDaysFromPostingDate = 1
+        Exit Function
+    End If
+    
+    Dim dMin As Date, dMax As Date, gotAny As Boolean
+    Dim r As Long, v As Variant, d As Date
+    
+    For r = 2 To lastRow
+        v = ws.Cells(r, colPost).Value
+        If IsDate(v) Then
+            d = DateValue(CDate(v))
+            If Not gotAny Then
+                dMin = d: dMax = d: gotAny = True
+            Else
+                If d < dMin Then dMin = d
+                If d > dMax Then dMax = d
+            End If
+        End If
+    Next r
+    
+    If gotAny Then
+        ComputeSellingDaysFromPostingDate = DateDiff("d", dMin, dMax) + 1
+        If ComputeSellingDaysFromPostingDate < 1 Then ComputeSellingDaysFromPostingDate = 1
+    Else
+        ComputeSellingDaysFromPostingDate = 1
+    End If
+End Function
+
+' =========================
+' Helpers: Table, headers, writing, names, temp
+' =========================
+Private Function GetOrCreateWorksheet(ByVal sheetName As String) As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        Set ws = ThisWorkbook.Worksheets.Add(After:=ThisWorkbook.Sheets(ThisWorkbook.Sheets.count))
+        ws.name = sheetName
+    End If
+    Set GetOrCreateWorksheet = ws
+End Function
+
+Private Function GetListObjectByName(ByVal ws As Worksheet, ByVal loName As String) As ListObject
+    Dim lo As ListObject
+    For Each lo In ws.ListObjects
+        If StrComp(lo.name, loName, vbTextCompare) = 0 Then
+            Set GetListObjectByName = lo
+            Exit Function
+        End If
+    Next lo
+    Set GetListObjectByName = Nothing
+End Function
+
+Private Sub SafeSetHeader(ByVal lo As ListObject, ByVal colIndex As Long, ByVal headerText As String)
+    If colIndex <= lo.ListColumns.count Then
+        lo.HeaderRowRange.Cells(1, colIndex).Value = headerText
+    End If
+End Sub
+Private Sub WriteColumn(ByVal lo As ListObject, ByVal colName As String, ByVal colData As Variant)
+    On Error GoTo SafeExit
+    Dim lc As ListColumn
+    Set lc = lo.ListColumns(colName)
+    If lc Is Nothing Then GoTo SafeExit
+    If lo.DataBodyRange Is Nothing Then GoTo SafeExit
+    lc.DataBodyRange.Value = colData
+SafeExit:
+End Sub
+
+Private Function GetArrayColumn(ByVal arr As Variant, ByVal colIndex As Long) As Variant
+    Dim r As Long, n As Long
+    n = UBound(arr, 1)
+    Dim outArr() As Variant
+    ReDim outArr(1 To n, 1 To 1)
+    For r = 1 To n
+        outArr(r, 1) = arr(r, colIndex)
+    Next r
+    GetArrayColumn = outArr
+End Function
+
+Private Sub SetNoSubtotal(ByVal pf As PivotField)
+    On Error Resume Next
+    pf.Subtotals = Array(False, False, False, False, False, False, False, False, False, False, False, False)
+    On Error GoTo 0
+End Sub
+
+Private Function FindHeaderColumn(ws As Worksheet, headerName As String) As Long
+    Dim lastCol As Long, j As Long
+    lastCol = ws.Cells(1, ws.Columns.count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        If LCase$(Trim$(CStr(ws.Cells(1, j).Value))) = LCase$(Trim$(headerName)) Then
+            FindHeaderColumn = j
+            Exit Function
+        End If
+    Next j
+    FindHeaderColumn = 0
+End Function
+
+Private Function FindHeaderColumnInRow(ws As Worksheet, headerName As String, headerRow As Long) As Long
+    Dim lastCol As Long, j As Long
+    lastCol = ws.Cells(headerRow, ws.Columns.count).End(xlToLeft).Column
+    For j = 1 To lastCol
+        If LCase$(Trim$(CStr(ws.Cells(headerRow, j).Value))) = LCase$(Trim$(headerName)) Then
+            FindHeaderColumnInRow = j
+            Exit Function
+        End If
+    Next j
+    FindHeaderColumnInRow = 0
+End Function
+
+Private Function ExtractInsideParenthesesOrOriginal(ByVal s As String) As String
+    Dim txt As String: txt = Trim$(CStr(s))
+    If Len(txt) = 0 Then ExtractInsideParenthesesOrOriginal = "": Exit Function
+    Dim pOpen As Long, pClose As Long
+    pOpen = InStrRev(txt, "(")
+    pClose = InStrRev(txt, ")")
+    If pOpen > 0 And pClose > pOpen Then
+        ExtractInsideParenthesesOrOriginal = Mid$(txt, pOpen + 1, pClose - pOpen - 1)
+    Else
+        ExtractInsideParenthesesOrOriginal = txt
+    End If
+End Function
+
+Private Function RemoveParentheses(ByVal s As String) As String
+    Dim txt As String: txt = Trim$(CStr(s))
+    If Len(txt) = 0 Then RemoveParentheses = "": Exit Function
+    Dim pOpen As Long
+    pOpen = InStrRev(txt, "(")
+    If pOpen > 0 Then
+        RemoveParentheses = Trim$(Left$(txt, pOpen - 1))
+    Else
+        RemoveParentheses = txt
+    End If
+End Function
+
+Private Function PickExcelFile() As String
+    Dim fd As FileDialog
+    Set fd = Application.FileDialog(msoFileDialogFilePicker)
+    With fd
+        .AllowMultiSelect = False
+        .Title = "Select source Excel file"
+        .Filters.Clear
+        .Filters.Add "Excel Files", "*.xlsx; *.xlsm; *.xlsb; *.xls"
+        .InitialView = msoFileDialogViewDetails
+        If .Show = -1 Then
+            PickExcelFile = .SelectedItems(1)
+        Else
+            PickExcelFile = ""
+        End If
+    End With
+End Function
+
+Private Function GetFirstDataSheet(ByVal wb As Workbook) As Worksheet
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets("Data")
+    On Error GoTo 0
+    If Not ws Is Nothing Then
+        Set GetFirstDataSheet = ws
+        Exit Function
+    End If
+    For Each ws In wb.Worksheets
+        If ws.UsedRange.Rows.count >= 2 And ws.UsedRange.Columns.count >= 1 Then
+            Set GetFirstDataSheet = ws
+            Exit Function
+        End If
+    Next ws
+    Set GetFirstDataSheet = Nothing
+End Function
+
+Private Function CreateTempSheetName(ByVal prefix As String) As String
+    CreateTempSheetName = prefix & Format(Now, "yyyymmdd_hhnnss")
+End Function
+
+Private Function EnsureUniqueSheetName(ByVal desiredName As String) As String
+    Dim candidate As String: candidate = desiredName
+    Dim i As Long: i = 1
+    Do While SheetOrChartExists(candidate, ThisWorkbook)
+        i = i + 1
+        candidate = desiredName & "_" & CStr(i)
+    Loop
+    EnsureUniqueSheetName = candidate
+End Function
+
+Private Function SheetOrChartExists(ByVal name As String, ByVal wb As Workbook) As Boolean
+    SheetOrChartExists = SheetExists(name, wb) Or ChartSheetExists(name, wb)
+End Function
+
+Private Function SheetExists(ByVal sheetName As String, ByVal wb As Workbook) As Boolean
+    On Error Resume Next
+    SheetExists = Not wb.Worksheets(sheetName) Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function ChartSheetExists(ByVal sheetName As String, ByVal wb As Workbook) As Boolean
+    Dim ch As Chart
+    On Error Resume Next
+    Set ch = wb.Charts(sheetName)
+    ChartSheetExists = Not (ch Is Nothing)
+    On Error GoTo 0
+End Function
